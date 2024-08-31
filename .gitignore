@@ -1,0 +1,8 @@
+.env
+.vscode
+out
+Taskfile.yml
+*.zip
+AVRArtifact
+build
+.DS_Store

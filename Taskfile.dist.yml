@@ -1,0 +1,13 @@
+version: 3
+
+tasks:
+  build:
+    dotenv: ['.env']
+    cmds:
+      - rm -rf ./out
+      - arduino-cli compile -P arduinoasisp --fqbn arduino:avr:uno
+        --build-property compiler.cpp.extra_flags="
+          -Dserial
+          -DBAUDRATE=19200
+        "
+        --output-dir ./out .
