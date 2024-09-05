@@ -10,7 +10,9 @@ unsigned long lastRotation = 0;
 
 // globals
 int displayedLetter = 0; // currently shown letter
-int desiredLetter = 0;   // letter to be shown
+int displayedAtStepperSpeed = 10; // stepper speed at which the letter was displayed
+int letterNumber = 0; // letter to show
+int stepperSpeed = 10;  // current speed of stepper
 const String letters[] = {" ", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "Ä", "Ö", "Ü", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", ":", ".", "-", "?", "!"};
 Stepper stepper(STEPS, STEPPERPIN1, STEPPERPIN3, STEPPERPIN2, STEPPERPIN4); // stepper setup
 bool lastInd1 = false;                                                      // store last status of phase
@@ -19,9 +21,7 @@ bool lastInd3 = false;                                                      // s
 bool lastInd4 = false;                                                      // store last status of phase
 float missedSteps = 0;                                                      // cummulate steps <1, to compensate via additional step when reaching >1
 int rotating = 0;                                                           // 1 = drum is currently rotating, 0 = drum is standing still
-int stepperSpeed = 10;                                                      // current speed of stepper, value only for first homing
 int calOffset;                                                              // Offset for calibration in steps, stored in EEPROM, gets read in setup
-int letterNumber = 0;
 int i2cAddress;
 bool offsetUpdatedFlag = false;
 
@@ -109,7 +109,7 @@ void loop()
   }
 
   // check if new letter was received through i2c
-  if (displayedLetter != letterNumber)
+  if (displayedLetter != letterNumber || displayedAtStepperSpeed != stepperSpeed)
   {
 #ifdef serial
     Serial.print("Value over serial received: ");
@@ -119,37 +119,32 @@ void loop()
     Serial.println();
 #endif
     // rotate to new letter
-    rotateToLetter(letterNumber);
+    rotateToLetter(letterNumber, stepperSpeed);
   }
 }
 
 // rotate to letter
-void rotateToLetter(int toLetter)
+void rotateToLetter(int toLetter, int stepperSpeed)
 {
   if (lastRotation == 0 || (millis() - lastRotation > OVERHEATINGTIMEOUT * 1000))
   {
     lastRotation = millis();
-    // get letter position
-    int posLetter = -1;
-    posLetter = toLetter;
-    int posCurrentLetter = -1;
-    posCurrentLetter = displayedLetter;
-    // int amountLetters = sizeof(letters) / sizeof(String);
 #ifdef serial
     Serial.print("go to letter: ");
     Serial.println(letters[toLetter]);
 #endif
     // go to letter, but only if available (>-1)
-    if (posLetter > -1)
+    if (toLetter > -1)
     { // check if letter exists
       // check if letter is on higher index, then no full rotaion is needed
-      if (posLetter >= posCurrentLetter)
+      if (toLetter >= displayedLetter)
       {
 #ifdef serial
         Serial.println("direct");
 #endif
         // go directly to next letter, get steps from current letter to target letter
-        int diffPosition = posLetter - posCurrentLetter;
+        int diffPosition = toLetter - displayedLetter;
+        diffPosition = diffPosition == 0 ? NUM_FLAPS : diffPosition; // if diff is 0, then a full rotation is needed
         startMotor();
         stepper.setSpeed(stepperSpeed);
         // doing the rotation letterwise
@@ -175,7 +170,7 @@ void rotateToLetter(int toLetter)
         calibrate(false); // calibrate revolver and do not stop motor
         // startMotor();
         stepper.setSpeed(stepperSpeed);
-        for (int i = 0; i < posLetter; i++)
+        for (int i = 0; i < toLetter; i++)
         {
           float preciseStep = (float)STEPS / (float)NUM_FLAPS;
           int roundedStep = (int)preciseStep;
@@ -190,8 +185,9 @@ void rotateToLetter(int toLetter)
       }
       // store new position
       displayedLetter = toLetter;
+      displayedAtStepperSpeed = stepperSpeed;
       // rotation is done, stop the motor
-      delay(100); // important to stop rotation before shutting of the motor to avoid rotation after switching off current
+      delay(100); // important to stop rotation before shutting off the motor to avoid rotation after switching off current
       stopMotor();
     }
     else
@@ -199,7 +195,6 @@ void rotateToLetter(int toLetter)
 #ifdef serial
       Serial.println("letter unknown, go to space");
 #endif
-      desiredLetter = 0;
     }
   }
 }
@@ -221,10 +216,6 @@ void commandHandler(int numBytes)
 
   Serial.print("Command received: ");
   Serial.println(kind);
-  Serial.print("COMMAND_UPDATE_OFFSET: ");
-  Serial.println(COMMAND_UPDATE_OFFSET);
-  Serial.print("COMMAND_SHOW_LETTER: ");
-  Serial.println(COMMAND_SHOW_LETTER);
 
   if (kind == COMMAND_UPDATE_OFFSET)
   {
@@ -246,9 +237,9 @@ void commandHandler(int numBytes)
   }
   else if (kind == COMMAND_SHOW_LETTER)
   {
-    Serial.print("Letter received: ");
     letterNumber = receivedInts[1];
     stepperSpeed = receivedInts[2];
+    Serial.print("Letter received: ");
     Serial.print(letters[letterNumber]);
     Serial.print(" Speed: ");
     Serial.println(stepperSpeed);
@@ -341,7 +332,6 @@ int calibrate(bool initialCalibration)
     {
       // seems that there is a problem with the marker or the sensor. turn of the motor to avoid overheating.
       displayedLetter = 0;
-      desiredLetter = 0;
       reachedMarker = true;
 #ifdef serial
       Serial.println("calibration revolver failed");
