@@ -226,7 +226,9 @@ void commandHandler(int numBytes)
   Serial.print("COMMAND_SHOW_LETTER: ");
   Serial.println(COMMAND_SHOW_LETTER);
 
-  if (kind == COMMAND_UPDATE_OFFSET)
+  switch (kind)
+  {
+  case COMMAND_UPDATE_OFFSET:
   {
     int newOffset = receivedInts[EEPROM_ADDR_OFFSET_HIGHER_BYTE] << 8 | receivedInts[EEPROM_ADDR_OFFSET_LOWER_BYTE];
     if (newOffset != calOffset)
@@ -243,8 +245,9 @@ void commandHandler(int numBytes)
       Serial.print("Caloffset not updated because it is the same as before: ");
       Serial.println(calOffset);
     }
+    break;
   }
-  else if (kind == COMMAND_SHOW_LETTER)
+  case COMMAND_SHOW_LETTER:
   {
     Serial.print("Letter received: ");
     letterNumber = receivedInts[1];
@@ -252,10 +255,18 @@ void commandHandler(int numBytes)
     Serial.print(letters[letterNumber]);
     Serial.print(" Speed: ");
     Serial.println(stepperSpeed);
+    break;
   }
-  else
+  case COMMAND_RESTART:
+  {
+    Serial.println("TODO: Restarting unit");
+    break;
+  }
+  default:
   {
     Serial.println("Unknown command");
+    break;
+  }
   }
 }
 
