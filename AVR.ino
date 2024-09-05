@@ -18,7 +18,7 @@ bool lastInd2 = false;                                                      // s
 bool lastInd3 = false;                                                      // store last status of phase
 bool lastInd4 = false;                                                      // store last status of phase
 float missedSteps = 0;                                                      // cummulate steps <1, to compensate via additional step when reaching >1
-int currentlyrotating = 0;                                                  // 1 = drum is currently rotating, 0 = drum is standing still
+int rotating = 0;                                                           // 1 = drum is currently rotating, 0 = drum is standing still
 int stepperSpeed = 10;                                                      // current speed of stepper, value only for first homing
 int calOffset;                                                              // Offset for calibration in steps, stored in EEPROM, gets read in setup
 int letterNumber = 0;
@@ -226,7 +226,9 @@ void commandHandler(int numBytes)
   Serial.print("COMMAND_SHOW_LETTER: ");
   Serial.println(COMMAND_SHOW_LETTER);
 
-  if (kind == COMMAND_UPDATE_OFFSET)
+  switch (kind)
+  {
+  case COMMAND_UPDATE_OFFSET:
   {
     int newOffset = receivedInts[EEPROM_ADDR_OFFSET_HIGHER_BYTE] << 8 | receivedInts[EEPROM_ADDR_OFFSET_LOWER_BYTE];
     if (newOffset != calOffset)
@@ -243,8 +245,9 @@ void commandHandler(int numBytes)
       Serial.print("Caloffset not updated because it is the same as before: ");
       Serial.println(calOffset);
     }
+    break;
   }
-  else if (kind == COMMAND_SHOW_LETTER)
+  case COMMAND_SHOW_LETTER:
   {
     Serial.print("Letter received: ");
     letterNumber = receivedInts[1];
@@ -252,17 +255,25 @@ void commandHandler(int numBytes)
     Serial.print(letters[letterNumber]);
     Serial.print(" Speed: ");
     Serial.println(stepperSpeed);
+    break;
   }
-  else
+  case COMMAND_RESTART:
+  {
+    Serial.println("TODO: Restarting unit");
+    break;
+  }
+  default:
   {
     Serial.println("Unknown command");
+    break;
+  }
   }
 }
 
 void requestHandler()
 {
   // Send unit status to master
-  Wire.write(currentlyrotating);
+  Wire.write(rotating);
   // Send offset to master
   uint8_t highByte = EEPROM.read(EEPROM_ADDR_OFFSET_HIGHER_BYTE);
   uint8_t lowByte = EEPROM.read(EEPROM_ADDR_OFFSET_LOWER_BYTE);
@@ -297,7 +308,7 @@ int calibrate(bool initialCalibration)
 #ifdef serial
   Serial.println("calibrate revolver");
 #endif
-  currentlyrotating = 1; // set active state to active
+  rotating = 1;
   bool reachedMarker = false;
   stepper.setSpeed(stepperSpeed);
   int i = 0;
@@ -369,7 +380,7 @@ void stopMotor()
 #ifdef serial
   Serial.println("Motor Stop");
 #endif
-  currentlyrotating = 0; // set active state to not active
+  rotating = 0;
   delay(100);
 }
 
@@ -378,7 +389,7 @@ void startMotor()
 #ifdef serial
   Serial.println("Motor Start");
 #endif
-  currentlyrotating = 1; // set active state to active
+  rotating = 1;
   digitalWrite(STEPPERPIN1, lastInd1);
   digitalWrite(STEPPERPIN2, lastInd2);
   digitalWrite(STEPPERPIN3, lastInd3);
