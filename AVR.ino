@@ -9,25 +9,31 @@
 unsigned long lastRotation = 0;
 
 // globals
-int displayedLetter = 0; // currently shown letter
+int displayedLetter = 0;          // currently shown letter
 int displayedAtStepperSpeed = 10; // stepper speed at which the letter was displayed
-int letterNumber = 0; // letter to show
-int stepperSpeed = 10;  // current speed of stepper
+int letterNumber = 0;             // letter to show
+int stepperSpeed = 10;            // current speed of stepper
 const String letters[] = {" ", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "Ä", "Ö", "Ü", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", ":", ".", "-", "?", "!"};
 Stepper stepper(STEPS, STEPPERPIN1, STEPPERPIN3, STEPPERPIN2, STEPPERPIN4); // stepper setup
 bool lastInd1 = false;                                                      // store last status of phase
 bool lastInd2 = false;                                                      // store last status of phase
 bool lastInd3 = false;                                                      // store last status of phase
 bool lastInd4 = false;                                                      // store last status of phase
-float missedSteps = 0;                                                      // cummulate steps <1, to compensate via additional step when reaching >1
-int rotating = 0;                                                           // 1 = drum is currently rotating, 0 = drum is standing still
-int calOffset;                                                              // Offset for calibration in steps, stored in EEPROM, gets read in setup
+bool rotating = false;                                                      // 1 = drum is currently rotating, 0 = drum is standing still
+float remainderSteps = 0;                                                   // remainder steps for precise rotation
+int offset;                                                              // Offset for calibration in steps, stored in EEPROM, gets read in setup
 int i2cAddress;
 bool offsetUpdatedFlag = false;
 
-// sleep globals
-const unsigned long WAIT_TIME = 2000; // wait time before sleep routine gets executed again in milliseconds
-unsigned long previousMillis = 0;     // stores last time sleep was interrupted
+volatile uint8_t vHighByte;
+volatile uint8_t vLowByte;
+volatile uint8_t vMagneticZeroPositionLetterIndex;
+
+volatile int receivedCommandInts[4];
+volatile bool applyCommandFlag = false;
+
+const unsigned long WAIT_TIME = 1000;
+unsigned long previousMillis = 0;
 // setup
 void setup()
 {
@@ -47,60 +53,46 @@ void setup()
   i2cAddress = getaddress(); // get I2C Address and save in variable
   // initialize serial
   Serial.begin(BAUDRATE);
+  Serial.println("===== AfterAI Flaps AVR 1.1.0 =====");
   Serial.println("starting unit");
   Serial.print("I2CAddress: ");
   Serial.println(i2cAddress);
 
   uint8_t restartTimes = EEPROM.read(0);
   EEPROM.write(0, restartTimes + 1);
+  int magneticZeroPositionLetterIndex = getMagneticZeroPositionLetterIndex();
+  if (magneticZeroPositionLetterIndex < 0 || magneticZeroPositionLetterIndex >= NUM_FLAPS)
+  {
+    EEPROM.write(EEPROM_ADDR_MAGNETIC_ZERO_POSITION_LETTER_INDEX_BYTE, 0);
+  }
+  getOffset();
+  if (offset < 0 || offset >= STEPS)
+  {
+    EEPROM.write(EEPROM_ADDR_OFFSET_HIGHER_BYTE, 0);
+    EEPROM.write(EEPROM_ADDR_OFFSET_LOWER_BYTE, 0);
+  }
+
 
   // I2C function assignment
   Wire.begin(i2cAddress);         // i2c address of this unit
+  Wire.setWireTimeout(25000, true); // set timeout to 25ms
   Wire.onReceive(commandHandler); // call-function for transfered letter via i2c
   Wire.onRequest(requestHandler); // call-function if master requests unit state
 
-  getOffset();     // get calibration offset
   calibrate(true); // home stepper after startup
-
-// test calibration settings
-#ifdef test
-  int calLetters[10] = {0, 26, 1, 21, 14, 43, 30, 31, 32, 39};
-  for (int i = 0; i < 10; i++)
-  {
-    int currentCalLetter = calLetters[i];
-    rotateToLetter(currentCalLetter);
-    delay(2000);
-  }
-#endif
 }
 
 void loop()
 {
-  unsigned long currentMillis = millis();
-  if (currentMillis - previousMillis >= WAIT_TIME)
+  vHighByte = EEPROM.read(EEPROM_ADDR_OFFSET_HIGHER_BYTE);
+  vLowByte = EEPROM.read(EEPROM_ADDR_OFFSET_LOWER_BYTE);
+  vMagneticZeroPositionLetterIndex = EEPROM.read(EEPROM_ADDR_MAGNETIC_ZERO_POSITION_LETTER_INDEX_BYTE);
+
+  if (applyCommandFlag)
   {
-    byte old_ADCSRA = ADCSRA;
-    // disable ADC
-    ADCSRA = 0;
-    set_sleep_mode(SLEEP_MODE_PWR_DOWN);
-    sleep_enable();
-#ifdef serial
-    digitalWrite(LED_BUILTIN, LOW); // shuts off LED when starting to sleep, for debugging
-#endif
-    sleep_cpu();
-#ifdef serial
-    digitalWrite(LED_BUILTIN, HIGH); // turns on LED when waking up, for debugging
-#endif
-    sleep_disable();
-    previousMillis = currentMillis; // reset sleep counter
-    ADCSRA = old_ADCSRA;
-
-    // release TWI bus
-    TWCR = bit(TWEN) | bit(TWIE) | bit(TWEA) | bit(TWINT);
-
-    // turn it back on again
-    Wire.begin(i2cAddress);
-  } // end of time to sleep
+    applyCommand();
+    applyCommandFlag = false;
+  }
 
   if (offsetUpdatedFlag)
   {
@@ -111,13 +103,11 @@ void loop()
   // check if new letter was received through i2c
   if (displayedLetter != letterNumber || displayedAtStepperSpeed != stepperSpeed)
   {
-#ifdef serial
     Serial.print("Value over serial received: ");
     Serial.print(letterNumber);
     Serial.print(" Letter: ");
     Serial.print(letters[letterNumber]);
     Serial.println();
-#endif
     // rotate to new letter
     rotateToLetter(letterNumber, stepperSpeed);
   }
@@ -126,119 +116,105 @@ void loop()
 // rotate to letter
 void rotateToLetter(int toLetter, int stepperSpeed)
 {
-  if (lastRotation == 0 || (millis() - lastRotation > OVERHEATINGTIMEOUT * 1000))
+  unsigned long currentMillis = millis();
+  if (lastRotation != 0 && lastRotation < currentMillis && (currentMillis - lastRotation < OVERHEATING_TIMEOUT_MILLIS))
   {
-    lastRotation = millis();
-#ifdef serial
-    Serial.print("go to letter: ");
-    Serial.println(letters[toLetter]);
-#endif
-    // go to letter, but only if available (>-1)
-    if (toLetter > -1)
-    { // check if letter exists
-      // check if letter is on higher index, then no full rotaion is needed
-      if (toLetter >= displayedLetter)
+    Serial.print("rotateToLetter: Overheating protection. currentMillis: ");
+    Serial.print(currentMillis);
+    Serial.print(" lastRotation: ");
+    Serial.print(lastRotation);
+    Serial.print(" diff: ");
+    Serial.println(currentMillis - lastRotation);
+    delay(OVERHEATING_TIMEOUT_MILLIS);
+    return;
+  }
+  if (toLetter < 0)
+  {
+    Serial.print("rotateToLetter: Unknown letter received: ");
+    Serial.println(toLetter);
+    return;
+  }
+  lastRotation = currentMillis;
+  Serial.print("rotateToLetter: go to letter: ");
+  Serial.println(letters[toLetter]);
+  int rawDistance = toLetter - displayedLetter;
+  int modDistance = (rawDistance + NUM_FLAPS) % NUM_FLAPS;
+  int distance = modDistance == 0 ? NUM_FLAPS : modDistance; // showing the next letter is difficult, so we make a full revolution
+  startMotor();
+  stepper.setSpeed(stepperSpeed);
+  float stepsPerLetter = (float)STEPS / (float)NUM_FLAPS;
+  int stepsPerLetterInt = (int)stepsPerLetter;
+  float remainderStepsPerLetter = stepsPerLetter - stepsPerLetterInt;
+  int magneticZeroPositionLetterIndex = getMagneticZeroPositionLetterIndex();
+  for (int i = 0; i < distance; i++, displayedLetter++)
+  {
+    if ((displayedLetter + 1) % NUM_FLAPS == magneticZeroPositionLetterIndex)
+    {
+      // reaching marker, go to calibrated offset position
+      for (int j = 0; j < stepsPerLetter * 2; j++)
       {
-#ifdef serial
-        Serial.println("direct");
-#endif
-        // go directly to next letter, get steps from current letter to target letter
-        int diffPosition = toLetter - displayedLetter;
-        diffPosition = diffPosition == 0 ? NUM_FLAPS : diffPosition; // if diff is 0, then a full rotation is needed
-        startMotor();
-        stepper.setSpeed(stepperSpeed);
-        // doing the rotation letterwise
-        for (int i = 0; i < diffPosition; i++)
+        bool magnetDetected = digitalRead(HALLPIN) == 0; // TCS40DPR outputs 0 when detected strong magnetic field
+        if (magnetDetected)
         {
-          float preciseStep = (float)STEPS / (float)NUM_FLAPS;
-          int roundedStep = (int)preciseStep;
-          missedSteps = missedSteps + ((float)preciseStep - (float)roundedStep);
-          if (missedSteps > 1)
-          {
-            roundedStep = roundedStep + 1;
-            missedSteps--;
-          }
-          stepper.step(ROTATIONDIRECTION * roundedStep);
+          continue;
         }
+        stepper.step(ROTATIONDIRECTION * 3);
       }
-      else
-      {
-        // full rotation is needed, good time for a calibration
-#ifdef serial
-        Serial.println("full rotation incl. calibration");
-#endif
-        calibrate(false); // calibrate revolver and do not stop motor
-        // startMotor();
-        stepper.setSpeed(stepperSpeed);
-        for (int i = 0; i < toLetter; i++)
-        {
-          float preciseStep = (float)STEPS / (float)NUM_FLAPS;
-          int roundedStep = (int)preciseStep;
-          missedSteps = missedSteps + (float)preciseStep - (float)roundedStep;
-          if (missedSteps > 1)
-          {
-            roundedStep = roundedStep + 1;
-            missedSteps--;
-          }
-          stepper.step(ROTATIONDIRECTION * roundedStep);
-        }
-      }
-      // store new position
-      displayedLetter = toLetter;
-      displayedAtStepperSpeed = stepperSpeed;
-      // rotation is done, stop the motor
-      delay(100); // important to stop rotation before shutting off the motor to avoid rotation after switching off current
-      stopMotor();
+      Serial.println("revolver calibrated");
+      remainderSteps = 0;
+      continue;
+    }
+    remainderSteps += remainderStepsPerLetter;
+    if (remainderSteps >= 1)
+    {
+      stepper.step(ROTATIONDIRECTION * (stepsPerLetterInt + 1)); // rotate to new letter
+      remainderSteps -= 1;
     }
     else
     {
-#ifdef serial
-      Serial.println("letter unknown, go to space");
-#endif
+      stepper.step((int)ROTATIONDIRECTION * stepsPerLetterInt); // rotate to new letter
     }
   }
+  // store new position
+  displayedLetter = toLetter;
+  displayedAtStepperSpeed = stepperSpeed;
+  delay(100); // important to stop rotation before shutting off the motor to avoid rotation after switching off current
+  stopMotor();
 }
 
+// NOTE: It is advised not to use Serial in interrupt routines
 void commandHandler(int numBytes)
 {
-  int receivedInts[3];
-
   for (int i = 0; i < numBytes; i++)
   {
-    Serial.print("Received byte ");
-    Serial.print(i);
-    Serial.print(": ");
-    receivedInts[i] = Wire.read();
-    Serial.println(receivedInts[i]);
+    receivedCommandInts[i] = Wire.read();
   }
+  applyCommandFlag = true;
+}
+
+void applyCommand() {
   // Write received bytes to correct variables
-  int kind = receivedInts[0];
+  int kind = receivedCommandInts[0];
 
   Serial.print("Command received: ");
   Serial.println(kind);
 
   if (kind == COMMAND_UPDATE_OFFSET)
   {
-    int newOffset = receivedInts[EEPROM_ADDR_OFFSET_HIGHER_BYTE] << 8 | receivedInts[EEPROM_ADDR_OFFSET_LOWER_BYTE];
-    if (newOffset != calOffset)
-    {
-      calOffset = newOffset;
-      EEPROM.write(EEPROM_ADDR_OFFSET_HIGHER_BYTE, receivedInts[EEPROM_ADDR_OFFSET_HIGHER_BYTE]);
-      EEPROM.write(EEPROM_ADDR_OFFSET_LOWER_BYTE, receivedInts[EEPROM_ADDR_OFFSET_LOWER_BYTE]);
-      Serial.print("Caloffset updated: ");
-      Serial.println(calOffset);
-      offsetUpdatedFlag = true;
-    }
-    else
-    {
-      Serial.print("Caloffset not updated because it is the same as before: ");
-      Serial.println(calOffset);
-    }
+    vHighByte = receivedCommandInts[EEPROM_ADDR_OFFSET_HIGHER_BYTE];
+    vLowByte = receivedCommandInts[EEPROM_ADDR_OFFSET_LOWER_BYTE];
+    vMagneticZeroPositionLetterIndex = receivedCommandInts[EEPROM_ADDR_MAGNETIC_ZERO_POSITION_LETTER_INDEX_BYTE];
+    offset = vHighByte << 8 | vLowByte;
+
+    EEPROM.update(EEPROM_ADDR_OFFSET_HIGHER_BYTE, receivedCommandInts[EEPROM_ADDR_OFFSET_HIGHER_BYTE]);
+    EEPROM.update(EEPROM_ADDR_OFFSET_LOWER_BYTE, receivedCommandInts[EEPROM_ADDR_OFFSET_LOWER_BYTE]);
+    EEPROM.update(EEPROM_ADDR_MAGNETIC_ZERO_POSITION_LETTER_INDEX_BYTE, receivedCommandInts[EEPROM_ADDR_MAGNETIC_ZERO_POSITION_LETTER_INDEX_BYTE]);
+    offsetUpdatedFlag = true;
   }
   else if (kind == COMMAND_SHOW_LETTER)
   {
-    letterNumber = receivedInts[1];
-    stepperSpeed = receivedInts[2];
+    letterNumber = receivedCommandInts[1];
+    stepperSpeed = receivedCommandInts[2];
     Serial.print("Letter received: ");
     Serial.print(letters[letterNumber]);
     Serial.print(" Speed: ");
@@ -250,19 +226,21 @@ void commandHandler(int numBytes)
   }
 }
 
+// NOTE: It is advised not to use Serial in interrupt routines
 void requestHandler()
 {
-  // Send unit status to master
   Wire.write(rotating);
-  // Send offset to master
-  uint8_t highByte = EEPROM.read(EEPROM_ADDR_OFFSET_HIGHER_BYTE);
-  uint8_t lowByte = EEPROM.read(EEPROM_ADDR_OFFSET_LOWER_BYTE);
-  Wire.write(highByte);
-  Wire.write(lowByte);
-  Serial.print("Offset sent: ");
+  Wire.write(vHighByte);
+  Wire.write(vLowByte);
+  Wire.write(vMagneticZeroPositionLetterIndex);
+  /*
+  Serial.print("Unit info sent: ");
   Serial.print(highByte);
   Serial.print(" ");
-  Serial.println(lowByte);
+  Serial.print(lowByte);
+  Serial.print(" ");
+  Serial.println(magneticZeroPositionLetterIndex);
+  */
 }
 
 // returns the adress of the unit as int
@@ -277,71 +255,61 @@ void getOffset()
 {
   int highByte = EEPROM.read(EEPROM_ADDR_OFFSET_HIGHER_BYTE);
   int lowByte = EEPROM.read(EEPROM_ADDR_OFFSET_LOWER_BYTE);
-  calOffset = highByte << 8 | lowByte;
-  Serial.print("Caloffset: ");
-  Serial.println(calOffset);
+  offset = highByte << 8 | lowByte;
+  Serial.print("offset: ");
+  Serial.println(offset);
+}
+
+int getMagneticZeroPositionLetterIndex()
+{
+  return EEPROM.read(EEPROM_ADDR_MAGNETIC_ZERO_POSITION_LETTER_INDEX_BYTE);
 }
 
 // doing a calibration of the revolver using the hall sensor
 int calibrate(bool initialCalibration)
 {
-#ifdef serial
   Serial.println("calibrate revolver");
-#endif
-  rotating = 1;
-  bool reachedMarker = false;
+  rotating = true;
   stepper.setSpeed(stepperSpeed);
-  int i = 0;
-  while (!reachedMarker)
-  {
-    // Because of the different wiring of the hall sensors of the blue ParaPara at home
-    // int currentHallValue = i2cAddress < 9 ? digitalRead(HALLPIN) : !digitalRead(HALLPIN);
-    int currentHallValue = digitalRead(HALLPIN); // TCS40DPR outputs 0 when detected strong magnetic field
-    Serial.print("Hall: ");
-    Serial.println(currentHallValue);
 
-    if (currentHallValue == 1 && i == 0)
-    { // already in zero position move out a bit and do the calibration {
-      // not reached yet
-      i = 50;
-      stepper.step(ROTATIONDIRECTION * 50); // move 50 steps to get out of scope of hall
-    }
-    else if (currentHallValue == 1)
+  // Kick off
+  bool magnetDetected = digitalRead(HALLPIN) == 0; // TCS40DPR outputs 0 when detected strong magnetic field
+  if (magnetDetected)
+  {
+    stepper.step(ROTATIONDIRECTION * (STEPS / NUM_FLAPS) * (NUM_FLAPS - 1));
+  }
+
+  for (int steps = 0; steps < STEPS * 2; steps++)
+  {
+    bool magnetDetected = digitalRead(HALLPIN) == 0; // TCS40DPR outputs 0 when detected strong magnetic field
+    Serial.print("calibrate: magnet detected: ");
+    Serial.println(magnetDetected);
+    if (!magnetDetected)
     {
       // not reached yet
       stepper.step(ROTATIONDIRECTION * 3);
+      continue;
     }
     else
     {
       // reached marker, go to calibrated offset position
-      reachedMarker = true;
-      stepper.step(ROTATIONDIRECTION * calOffset);
+      stepper.step(ROTATIONDIRECTION * offset); // TODO: check if this is correct
       displayedLetter = 0;
-      missedSteps = 0;
-#ifdef serial
+      remainderSteps = 0;
       Serial.println("revolver calibrated");
-#endif
       // Only stop motor for initial calibration
       if (initialCalibration)
       {
         stopMotor();
       }
-      return i;
+      return steps;
     }
-    if (i > 3 * STEPS)
-    {
-      // seems that there is a problem with the marker or the sensor. turn of the motor to avoid overheating.
-      displayedLetter = 0;
-      reachedMarker = true;
-#ifdef serial
-      Serial.println("calibration revolver failed");
-#endif
-      stopMotor();
-      return -1;
-    }
-    i++;
   }
-  return i;
+  // seems that there is a problem with the marker or the sensor. turn of the motor to avoid overheating.
+  displayedLetter = 0;
+  Serial.println("calibration revolver failed");
+  stopMotor();
+  return -1;
 }
 
 // switching off the motor driver
@@ -356,19 +324,15 @@ void stopMotor()
   digitalWrite(STEPPERPIN2, LOW);
   digitalWrite(STEPPERPIN3, LOW);
   digitalWrite(STEPPERPIN4, LOW);
-#ifdef serial
   Serial.println("Motor Stop");
-#endif
-  rotating = 0;
+  rotating = false;
   delay(100);
 }
 
 void startMotor()
 {
-#ifdef serial
   Serial.println("Motor Start");
-#endif
-  rotating = 1;
+  rotating = true;
   digitalWrite(STEPPERPIN1, lastInd1);
   digitalWrite(STEPPERPIN2, lastInd2);
   digitalWrite(STEPPERPIN3, lastInd3);

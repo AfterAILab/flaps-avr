@@ -33,12 +33,12 @@
 
 // constants others
 #define ROTATIONDIRECTION 1     //-1 for reverse direction
-#define OVERHEATINGTIMEOUT 2    // timeout in seconds to avoid overheating of stepper. After starting rotation, the counter will start. Stepper won't move again until timeout is passed
+#define OVERHEATING_TIMEOUT_MILLIS 2000    // timeout in milliseconds to avoid overheating of stepper. After starting rotation, the counter will start. Stepper won't move again until timeout is passed
 #define COMMAND_UPDATE_OFFSET 0 // command to update offset
 #define COMMAND_SHOW_LETTER 1   // command to show letter
 
 // EEPROM addresses
 #define EEPROM_ADDR_OFFSET_HIGHER_BYTE 1 // offset in EEPROM
 #define EEPROM_ADDR_OFFSET_LOWER_BYTE 2  // offset in EEPROM
-
+#define EEPROM_ADDR_MAGNETIC_ZERO_POSITION_LETTER_INDEX_BYTE 3
 // 2038 steps / 45 letters = 45.28888 steps / letter
